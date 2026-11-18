@@ -1,0 +1,611 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <HTTPClient.h>
+#include <Preferences.h>
+#include <esp_sleep.h>
+#include <time.h>
+
+// === KONFIGURASI LAYAR OLED ===
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+#define OLED_COLOR_WHITE SSD1306_WHITE
+#define OLED_COLOR_BLACK SSD1306_BLACK
+
+// === PIN KHUSUS ESP32-C3 SUPER MINI ===
+#define BUTTON1_PIN 4  // Tombol Action (Mendukung Wakeup GPIO 0-5)
+#define BUTTON2_PIN 5  // Tombol Mode
+#define BUZZER_PIN  3  // Buzzer Piezo
+#define LED_PIN     7  // Pin LED indikator
+
+// === DAFTAR MODE ===
+enum AppMode { 
+  MODE_PET, MODE_STATS, MODE_MEMENTO, MODE_POMODORO, 
+  MODE_GAME, MODE_PONG, MODE_QUOTE, MODE_GPS, MODE_8BALL, 
+  MODE_PROMPTER, MODE_WIFI, MODE_MATRIX, MODE_MSG 
+};
+AppMode currentAppMode = MODE_PET;
+enum PetState { IDLE, SLEEPY, HAPPY, HUNGRY, BORED, LEVEL_UP_STATE, SHOCKED, WINK, SICK };
+PetState currentState = IDLE;
+
+// === LOKASI & CUACA ===
+float currentLat = -6.2088; float currentLon = 106.8456;
+int currentTemp = 0; String weatherDesc = "N/A";
+unsigned long lastWeatherUpdate = 0;
+const unsigned long WEATHER_INTERVAL = 1800000; 
+
+// === QUOTES & 8-BALL ===
+const char* petQuotes[] = { "Fokus pada apa\nyang bisa kamu\nkendalikan.", "Amor Fati:\nCintai takdirmu\nhari ini.", "Disiplin adalah\nkunci menuju\nkebebasan.", "Tidak ada yang\nlebih bernilai\ndari hari ini.", "Sakit itu nyata,\nmenderita itu\npilihan." };
+int currentQuoteIdx = 0;
+const char* stoic8Ball[] = { "LAKUKAN", "BIARKAN", "TERIMA", "FOKUS", "LEPASKAN", "DIAMKAN" };
+int current8BallIdx = 0;
+
+// === CHORD PROMPTER & MESSAGE BOARD ===
+String currentPrompterLine = "Standby...";
+String incomingMsg = "";
+
+// === WIFI ANALYZER & MATRIX ===
+int matrixY[16];
+unsigned long lastWifiScan = 0;
+
+// === WI-FI & NTP ===
+String wifiSSID = "Wifi"; 
+String wifiPASS = "Wifi123";
+const char* ntpServer = "pool.ntp.org";
+const long  gmtOffset_sec = 25200; const int daylightOffset_sec = 0;
+
+WebServer server(80);
+Preferences preferences;
+
+const unsigned char PROGMEM icon_sun[] = { 0x18, 0x99, 0x42, 0x3c, 0x3c, 0x42, 0x99, 0x18 };
+const unsigned char PROGMEM icon_cloud[] = { 0x00, 0x18, 0x3c, 0x7e, 0xff, 0xff, 0x00, 0x00 };
+const unsigned char PROGMEM icon_rain[] = { 0x18, 0x3c, 0x7e, 0xff, 0x00, 0x24, 0x48, 0x10 };
+
+bool isOnline = false;
+int currentHour = 12, currentMin = 0;
+unsigned long lastOfflineSec = 0, lastTimeUpdate = 0;
+
+int currentEXP = 0, petLevel = 1;
+String evolutionTitle = "Seedling";
+
+bool pomodoroRunning = false, pomodoroIsBreak = false;
+int pomodoroSecondsLeft = 25 * 60; 
+unsigned long lastPomodoroTick = 0;
+
+// === DODGE GAME ===
+bool gameActive = false, gameOver = false;
+int petY = 38, petVY = 0, gameScore = 0, highScore = 0;
+const int gravity = 1;
+int obstacleX = 128, obstacleWidth = 8, obstacleHeight = 12;
+
+// === PONG GAME VS AI ===
+float pongBX = 64, pongBY = 32, pongBDX = 2.5, pongBDY = 1.5;
+int pongPlayerY = 24, pongAiY = 24, pongScoreP = 0, pongScoreAI = 0;
+bool pongPlayerMovingUp = true;
+
+unsigned long lastInteractionTime = 0, lastHungerDecay = 0, stateTimer = 0;
+int hungerLevel = 100;
+
+// === VARIABEL 2 TOMBOL ===
+unsigned long b1PressStart = 0, lastB1Time = 0;
+bool isB1Pressed = false, b1LongTriggered = false;
+int b1ClickCount = 0;
+
+unsigned long b2PressStart = 0;
+bool isB2Pressed = false, b2LongTriggered = false;
+
+// =========================================================================
+// === HTML DASHBOARD MEWAH                                              ===
+// =========================================================================
+const char HTML_PAGE[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CyberPet Control Center</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&display=swap" rel="stylesheet">
+  <style>
+    :root { --bg: #090e17; --primary: #3b82f6; --card: rgba(30, 41, 59, 0.6); }
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Inter', sans-serif; }
+    body { background: var(--bg); color: #f1f5f9; display: flex; justify-content: center; padding: 20px; min-height: 100vh; }
+    .app-container { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 20px; }
+    .card { background: var(--card); backdrop-filter: blur(12px); border: 1px solid rgba(255,255,255,0.05); border-radius: 20px; padding: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
+    .header { text-align: center; font-weight: 800; font-size: 26px; color: var(--primary); margin-bottom: 5px; }
+    .status-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 20px; }
+    .status-item { background: rgba(0,0,0,0.2); padding: 15px; border-radius: 12px; text-align: center; }
+    .status-item span { display: block; font-size: 12px; color: #94a3b8; text-transform: uppercase; margin-bottom: 5px; }
+    .status-item b { font-size: 18px; color: #fff; }
+    .btn-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .btn { padding: 16px; border: none; border-radius: 14px; font-weight: 600; cursor: pointer; color: #fff; transition: all 0.2s; }
+    .btn:active { transform: scale(0.95); }
+    .btn-blue { background: linear-gradient(135deg, #2563eb, #3b82f6); grid-column: span 2;}
+    .btn-green { background: linear-gradient(135deg, #059669, #10b981); }
+    .btn-orange { background: linear-gradient(135deg, #ea580c, #f97316); }
+    .btn-purple { background: linear-gradient(135deg, #7c3aed, #8b5cf6); }
+    .btn-red { background: linear-gradient(135deg, #be123c, #e11d48); }
+    .btn-dark { background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.1); }
+    input, textarea { width: 100%; padding: 14px; margin-top: 10px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); background: rgba(0,0,0,0.3); color: #fff; outline: none; }
+    textarea { resize: vertical; min-height: 100px; font-family: monospace; }
+    #toast { position: fixed; bottom: 30px; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--primary); color: #fff; padding: 12px 24px; border-radius: 30px; font-weight: 600; opacity: 0; transition: all 0.3s; pointer-events: none; z-index: 1000;}
+    #toast.show { transform: translateX(-50%) translateY(0); opacity: 1; }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <div class="card">
+      <div class="header">CYBERPET 4.4</div>
+      <p style="text-align:center; color:#94a3b8; font-size:13px; margin-bottom:20px;">C3 SuperMini Edition</p>
+      <div class="status-grid">
+        <div class="status-item"><span>Status</span><b id="state">Syncing...</b></div>
+        <div class="status-item"><span>Level</span><b id="level">--</b></div>
+        <div class="status-item"><span>Weather</span><b id="temp">--°C</b></div>
+        <div class="status-item"><span>Hunger</span><b id="hunger">--%</b></div>
+      </div>
+      <div class="btn-grid">
+        <button class="btn btn-blue" onclick="sendCmd('/feed')">🍖 Feed Pet</button>
+        <button class="btn btn-green" onclick="sendCmd('/wink')">😉 Wink</button>
+        <button class="btn btn-orange" onclick="sendCmd('/shock')">😲 Shock</button>
+        <button class="btn btn-purple" onclick="sendCmd('/toggle_pomo')">⏱️ Pomodoro</button>
+      </div>
+    </div>
+    
+    <div class="card">
+      <h3 style="font-size:16px; margin-bottom:5px;">💬 Hack / Live Message</h3>
+      <input type="text" id="live-msg" placeholder="Ketik pesan disini..." maxlength="30">
+      <button class="btn btn-red" style="width:100%; margin-top:15px;" onclick="sendLiveMsg()">🚨 BROADCAST PESAN</button>
+    </div>
+
+    <div class="card">
+      <h3 style="font-size:16px; margin-bottom:5px;">🎸 Chord Prompter</h3>
+      <textarea id="prompter-text" placeholder="[Am] Lirik baris pertama...&#10;[G] Lirik baris kedua..."></textarea>
+      <div class="btn-grid" style="margin-top:10px;">
+        <button class="btn btn-green" style="grid-column: span 1;" onclick="startPrompter()">▶️ Mulai</button>
+        <button class="btn btn-dark" style="grid-column: span 1;" onclick="stopPrompter()">⏹️ Stop</button>
+      </div>
+      <div id="prompter-status" style="font-size:12px; color:#10b981; margin-top:12px; text-align:center;"></div>
+    </div>
+  </div>
+  <div id="toast">Command Sent!</div>
+  
+  <script>
+    function showToast(msg) {
+      const toast = document.getElementById('toast');
+      toast.innerText = msg; toast.classList.add('show');
+      setTimeout(function() { toast.classList.remove('show'); }, 3000);
+    }
+    
+    function updateStatus() {
+      fetch('/api/status')
+        .then(function(r) { return r.json(); })
+        .then(function(data) {
+          document.getElementById('state').innerText = data.state;
+          document.getElementById('level').innerText = 'L' + data.level + ' ' + data.title;
+          document.getElementById('temp').innerText = data.temp + '°C';
+          document.getElementById('hunger').innerText = data.hunger + '%';
+        })
+        .catch(function(e) { document.getElementById('state').innerText = "Disconnected"; });
+    }
+    
+    function sendCmd(ep) { fetch(ep).then(function() { showToast("Action Executed!"); updateStatus(); }); }
+    function sendLiveMsg() {
+      const msg = document.getElementById('live-msg').value;
+      if(!msg) { showToast("Pesan kosong!"); return; }
+      fetch("/send_msg?text=" + encodeURIComponent(msg)).then(function() { showToast("Pesan Terkirim!"); document.getElementById('live-msg').value = ""; });
+    }
+
+    let prompterInterval;
+    function startPrompter() {
+      const text = document.getElementById('prompter-text').value;
+      const status = document.getElementById('prompter-status');
+      if(!text) { showToast("Kolom teks kosong!"); return; }
+      clearInterval(prompterInterval);
+      const linesRaw = text.split('\n'); const lines = [];
+      for(let k = 0; k < linesRaw.length; k++) { let t = linesRaw[k].trim(); if(t.length > 0) lines.push(t); }
+      let i = 0; status.innerText = "Memulai Transmisi...";
+      prompterInterval = setInterval(function() {
+        if(i < lines.length) { fetch("/set_prompter?text=" + encodeURIComponent(lines[i].substring(0, 42))); status.innerText = "Baris: " + (i + 1) + " / " + lines.length; i++; } 
+        else { clearInterval(prompterInterval); status.innerText = "Selesai."; }
+      }, 4000); 
+    }
+    function stopPrompter() { clearInterval(prompterInterval); document.getElementById('prompter-status').innerText = "Dihentikan manual."; }
+
+    setInterval(updateStatus, 2000); updateStatus();
+  </script>
+</body>
+</html>
+)rawliteral";
+// =========================================================================
+
+// INISIALISASI I2C KHUSUS C3: SDA=8, SCL=9
+bool initOLED() { Wire.begin(8, 9); Wire.setClock(100000); return display.begin(SSD1306_SWITCHCAPVCC, 0x3C) || display.begin(SSD1306_SWITCHCAPVCC, 0x3D); }
+void safeDisplayRender() { Wire.beginTransmission(0x3C); if (Wire.endTransmission() != 0) { Wire.beginTransmission(0x3D); if (Wire.endTransmission() != 0) initOLED(); } display.display(); }
+void checkNightMode() { display.ssd1306_command(SSD1306_SETCONTRAST); display.ssd1306_command((currentHour >= 22 || currentHour < 5) ? 15 : 255); }
+
+void playSound(String type) {
+  ledcWrite(BUZZER_PIN, 1024);
+  if (type == "HAPPY") { ledcWriteTone(BUZZER_PIN, 523); delay(80); ledcWriteTone(BUZZER_PIN, 659); delay(100); } 
+  else if (type == "HUNGRY" || type == "SICK") { ledcWriteTone(BUZZER_PIN, 300); delay(120); ledcWriteTone(BUZZER_PIN, 220); delay(150); } 
+  else if (type == "SLEEP") { ledcWriteTone(BUZZER_PIN, 300); delay(150); ledcWriteTone(BUZZER_PIN, 150); delay(300); } 
+  else if (type == "WAKE") { ledcWriteTone(BUZZER_PIN, 220); delay(80); ledcWriteTone(BUZZER_PIN, 440); delay(80); ledcWriteTone(BUZZER_PIN, 880); delay(100); } 
+  else if (type == "LEVELUP") { ledcWriteTone(BUZZER_PIN, 440); delay(100); ledcWriteTone(BUZZER_PIN, 554); delay(100); ledcWriteTone(BUZZER_PIN, 659); delay(200); } 
+  else if (type == "JUMP") { ledcWriteTone(BUZZER_PIN, 700); delay(35); } 
+  else if (type == "GAMEOVER") { ledcWriteTone(BUZZER_PIN, 180); delay(250); }
+  else if (type == "BEEP") { ledcWriteTone(BUZZER_PIN, 2000); delay(50); }
+  else if (type == "ALARM") { ledcWriteTone(BUZZER_PIN, 1000); delay(150); ledcWriteTone(BUZZER_PIN, 1500); delay(150); ledcWriteTone(BUZZER_PIN, 1000); delay(150); }
+  ledcWrite(BUZZER_PIN, 0); 
+}
+
+void loadPreferencesData() {
+  preferences.begin("pet_data", true); petLevel = preferences.getInt("level", 1); currentEXP = preferences.getInt("exp", 0); highScore = preferences.getInt("hscore", 0); preferences.end();
+  evolutionTitle = (petLevel == 1) ? "Seedling" : (petLevel == 2) ? "Sprout" : (petLevel == 3) ? "Bloom" : "Ancient";
+  preferences.begin("wifi_data", true); wifiSSID = preferences.getString("ssid", wifiSSID); wifiPASS = preferences.getString("pass", wifiPASS); preferences.end();
+}
+
+void saveEvolutionData() { preferences.begin("pet_data", false); preferences.putInt("level", petLevel); preferences.putInt("exp", currentEXP); preferences.putInt("hscore", highScore); preferences.end(); }
+
+void enterDeepSleep() { 
+  saveEvolutionData(); 
+  display.clearDisplay(); 
+  safeDisplayRender(); 
+  digitalWrite(LED_PIN, LOW); 
+  esp_deep_sleep_enable_gpio_wakeup(1ULL << BUTTON1_PIN, ESP_GPIO_WAKEUP_GPIO_LOW); 
+  esp_deep_sleep_start(); 
+}
+
+void checkEvolution() { if (currentEXP >= (petLevel * 100)) { currentEXP -= (petLevel * 100); petLevel++; evolutionTitle = (petLevel == 2) ? "Sprout" : (petLevel == 3) ? "Bloom" : "Ancient"; saveEvolutionData(); currentState = LEVEL_UP_STATE; stateTimer = millis(); playSound("LEVELUP"); } }
+void triggerFeed() { if (currentState == SICK) return; hungerLevel = 100; lastInteractionTime = millis(); currentEXP += 25; saveEvolutionData(); if (currentState != LEVEL_UP_STATE) { currentState = HAPPY; stateTimer = millis(); playSound("HAPPY"); } checkEvolution(); }
+void curePet() { if (currentState == SICK) { hungerLevel = 50; currentState = HAPPY; stateTimer = millis(); lastInteractionTime = millis(); playSound("HAPPY"); } }
+void triggerShocked() { if (currentState == SICK) return; currentState = SHOCKED; stateTimer = millis(); lastInteractionTime = millis(); playSound("HUNGRY"); }
+void triggerWink() { if (currentState == SICK) return; currentState = WINK; stateTimer = millis(); lastInteractionTime = millis(); playSound("HAPPY"); }
+String getStateString() { if(currentState==HAPPY)return"HAPPY"; if(currentState==SHOCKED)return"SHOCKED"; if(currentState==SICK)return"SICK"; return "IDLE"; }
+
+void updateTime() {
+  if (millis() - lastTimeUpdate >= 1000) { 
+    lastTimeUpdate = millis();
+    if (isOnline) { time_t now; struct tm timeinfo; time(&now); localtime_r(&now, &timeinfo); if (timeinfo.tm_year > 70) { currentHour = timeinfo.tm_hour; currentMin = timeinfo.tm_min; } } 
+    else { if (millis() - lastOfflineSec >= 60000) { lastOfflineSec = millis(); currentMin++; if (currentMin >= 60) { currentMin = 0; currentHour = (currentHour + 1) % 24; } } }
+  }
+}
+
+void fetchWeather() {
+  if (!isOnline || WiFi.status() != WL_CONNECTED) return;
+  HTTPClient http; http.setTimeout(1500); String weatherUrl = "http://api.open-meteo.com/v1/forecast?latitude=" + String(currentLat, 4) + "&longitude=" + String(currentLon, 4) + "&current_weather=true";
+  if (http.begin(weatherUrl)) { if (http.GET() == HTTP_CODE_OK) {
+      String payload = http.getString();
+      int tempIdx = payload.indexOf("\"temperature\":");
+      if (tempIdx != -1) { int commaIdx = payload.indexOf(",", tempIdx); currentTemp = payload.substring(tempIdx + 14, commaIdx).toInt(); }
+      int codeIdx = payload.indexOf("\"weathercode\":");
+      if (codeIdx != -1) { int commaIdx = payload.indexOf("}", codeIdx); int code = payload.substring(codeIdx + 14, commaIdx).toInt(); weatherDesc = (code == 0) ? "Clear" : (code <= 3) ? "Cloudy" : "Rain"; }
+    } http.end(); }
+}
+
+void updatePomodoro() {
+  if (!pomodoroRunning) return;
+  if (millis() - lastPomodoroTick >= 1000) {
+    lastPomodoroTick = millis();
+    if (pomodoroSecondsLeft > 0) pomodoroSecondsLeft--;
+    else { pomodoroIsBreak = !pomodoroIsBreak; pomodoroSecondsLeft = pomodoroIsBreak ? 300 : 1500; playSound("LEVELUP"); if (!pomodoroIsBreak) { currentEXP += 50; saveEvolutionData(); checkEvolution(); } }
+  }
+}
+
+void updateGameLogic() {
+  if (currentAppMode != MODE_GAME || (!gameActive && !gameOver)) return;
+  if (gameActive) {
+    petY += petVY; petVY += gravity; if (petY >= 38) { petY = 38; petVY = 0; }
+    obstacleX -= (3 + (gameScore / 4));
+    if (obstacleX < -obstacleWidth) { obstacleX = 128; gameScore++; playSound("HAPPY"); }
+    if (obstacleX < 28 && (obstacleX + obstacleWidth) > 16 && petY >= (50 - obstacleHeight)) {
+      gameActive = false; gameOver = true; playSound("GAMEOVER");
+      if (gameScore > highScore) highScore = gameScore; currentEXP += gameScore * 2; saveEvolutionData(); checkEvolution();
+    }
+  }
+}
+
+void resetPongBall() { pongBX = 64; pongBY = 32; pongBDX = (random(0,2)==0) ? 2.5 : -2.5; pongBDY = (random(0,2)==0) ? 1.5 : -1.5; }
+
+void updatePongLogic() {
+  if (currentAppMode != MODE_PONG) return;
+  if (pongPlayerMovingUp) pongPlayerY -= 2; else pongPlayerY += 2;
+  if (pongPlayerY < 0) pongPlayerY = 0; if (pongPlayerY > 48) pongPlayerY = 48; 
+  if (pongBX > 64 && pongBDX > 0) { if (pongAiY + 8 < pongBY) pongAiY += 2; else if (pongAiY + 8 > pongBY) pongAiY -= 2; }
+  if (pongAiY < 0) pongAiY = 0; if (pongAiY > 48) pongAiY = 48;
+  pongBX += pongBDX; pongBY += pongBDY;
+  if (pongBY <= 0 || pongBY >= 60) { pongBDY = -pongBDY; playSound("BEEP"); }
+  if (pongBX <= 4 && pongBX >= 2) { if (pongBY + 4 >= pongPlayerY && pongBY <= pongPlayerY + 16) { pongBDX = -pongBDX; pongBX = 5; playSound("JUMP"); } }
+  if (pongBX >= 120 && pongBX <= 122) { if (pongBY + 4 >= pongAiY && pongBY <= pongAiY + 16) { pongBDX = -pongBDX; pongBX = 119; playSound("JUMP"); } }
+  if (pongBX < 0) { pongScoreAI++; resetPongBall(); playSound("GAMEOVER"); delay(500); }
+  if (pongBX > 128) { pongScoreP++; currentEXP += 5; saveEvolutionData(); checkEvolution(); resetPongBall(); playSound("HAPPY"); delay(500); }
+}
+
+void handleButtons() {
+  unsigned long now = millis();
+  
+  // --- TOMBOL 1 (ACTION) ---
+  int b1State = digitalRead(BUTTON1_PIN);
+  if (b1State == LOW) {
+    if (!isB1Pressed) {
+      isB1Pressed = true; b1PressStart = now; b1LongTriggered = false;
+      if (currentAppMode == MODE_GAME) {
+        if (!gameActive && !gameOver) { gameActive = true; gameScore = 0; obstacleX = 128; petY = 38; playSound("JUMP"); } 
+        else if (gameActive && petY == 38) { petVY = -7; playSound("JUMP"); }
+      }
+    } else if (!b1LongTriggered && (now - b1PressStart >= 2500)) {
+      b1LongTriggered = true; b1ClickCount = 0; playSound("SLEEP"); delay(800); enterDeepSleep();
+    }
+  } else {
+    if (isB1Pressed) {
+      isB1Pressed = false;
+      if (!b1LongTriggered) { if (currentAppMode != MODE_GAME || gameOver) { b1ClickCount++; lastB1Time = now; } }
+    }
+  }
+
+  if (b1ClickCount > 0 && (now - lastB1Time > 350)) {
+    if (b1ClickCount == 2) {
+      if (gameOver) { gameOver = false; gameActive = true; gameScore = 0; obstacleX = 128; petY = 38; playSound("JUMP"); } 
+      else if (currentState == SICK) curePet(); else triggerFeed();
+    } 
+    else if (b1ClickCount == 1) {
+      if (currentAppMode == MODE_PET) triggerWink();
+      else if (currentAppMode == MODE_POMODORO) { pomodoroRunning = !pomodoroRunning; playSound("HAPPY"); }
+      else if (currentAppMode == MODE_QUOTE) { currentQuoteIdx = random(0, 5); playSound("WAKE"); }
+      else if (currentAppMode == MODE_8BALL) { current8BallIdx = random(0, 6); playSound("JUMP"); }
+      else if (currentAppMode == MODE_PONG) { pongPlayerMovingUp = !pongPlayerMovingUp; playSound("JUMP"); } 
+      else if (currentAppMode == MODE_PROMPTER || currentAppMode == MODE_MSG) { currentAppMode = MODE_PET; playSound("HAPPY"); } 
+    }
+    b1ClickCount = 0;
+  }
+
+  // --- TOMBOL 2 (MODE) ---
+  int b2State = digitalRead(BUTTON2_PIN);
+  if (b2State == LOW) {
+    if (!isB2Pressed) { isB2Pressed = true; b2PressStart = now; b2LongTriggered = false; } 
+    else if (!b2LongTriggered && (now - b2PressStart >= 1000)) {
+      b2LongTriggered = true; currentAppMode = MODE_PET; playSound("HAPPY");
+    }
+  } else {
+    if (isB2Pressed) {
+      isB2Pressed = false;
+      if (!b2LongTriggered) { currentAppMode = (AppMode)((currentAppMode + 1) % 13); playSound("WAKE"); }
+    }
+  }
+}
+
+// === RENDER LAYAR ===
+void renderPetMode(unsigned long currentMillis) {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(2, 2); display.printf("LVL %d", petLevel); display.setCursor(44, 2); display.printf("%02d:%02d", currentHour, currentMin);
+  if (isOnline) {
+    if (weatherDesc == "Clear") display.drawBitmap(82, 2, icon_sun, 8, 8, OLED_COLOR_WHITE);
+    else if (weatherDesc == "Cloudy") display.drawBitmap(82, 2, icon_cloud, 8, 8, OLED_COLOR_WHITE);
+    else if (weatherDesc == "Rain") display.drawBitmap(82, 2, icon_rain, 8, 8, OLED_COLOR_WHITE);
+  }
+  display.drawRoundRect(100, 2, 26, 8, 3, OLED_COLOR_WHITE); int fillWidth = map(hungerLevel, 0, 100, 0, 22); if (fillWidth > 0) display.fillRoundRect(102, 4, fillWidth, 4, 1, OLED_COLOR_WHITE);
+  display.drawFastHLine(0, 12, 128, OLED_COLOR_WHITE);
+  int eyeY = 22, pupilOffset = (currentMillis / 2000) % 3 - 1;
+  switch (currentState) {
+    case IDLE: display.fillCircle(38, eyeY + 8, 11, OLED_COLOR_WHITE); display.fillCircle(90, eyeY + 8, 11, OLED_COLOR_WHITE); display.fillCircle(38 + pupilOffset, eyeY + 8, 4, OLED_COLOR_BLACK); display.fillCircle(90 + pupilOffset, eyeY + 8, 4, OLED_COLOR_BLACK); break;
+    case HAPPY: case LEVEL_UP_STATE: display.drawCircleHelper(38, eyeY+10, 10, 1, OLED_COLOR_WHITE); display.drawCircleHelper(90, eyeY+10, 10, 1, OLED_COLOR_WHITE); break;
+    case SHOCKED: display.drawCircle(38, eyeY+8, 12, OLED_COLOR_WHITE); display.drawCircle(90, eyeY+8, 12, OLED_COLOR_WHITE); display.fillCircle(38, eyeY+8, 3, OLED_COLOR_WHITE); display.fillCircle(90, eyeY+8, 3, OLED_COLOR_WHITE); break;
+    case WINK: display.drawLine(28, eyeY+8, 48, eyeY+8, OLED_COLOR_WHITE); display.fillCircle(90, eyeY+8, 11, OLED_COLOR_WHITE); display.fillCircle(90, eyeY+8, 4, OLED_COLOR_BLACK); break;
+    default: display.fillRoundRect(28, eyeY+4, 20, 8, 3, OLED_COLOR_WHITE); display.fillRoundRect(80, eyeY+4, 20, 8, 3, OLED_COLOR_WHITE); break;
+  }
+  display.drawFastHLine(0, 50, 128, OLED_COLOR_WHITE); display.setCursor(2, 54); display.printf("[%s]", evolutionTitle.c_str()); display.setCursor(80, 54); display.printf("%d XP", currentEXP);
+}
+
+void renderStatsMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(16, 2); display.print("=== STATUS PET ==="); display.drawFastHLine(0, 12, 128, OLED_COLOR_WHITE);
+  display.setCursor(2, 18); display.print("WiFi : "); display.print(isOnline ? wifiSSID : "Offline"); display.setCursor(2, 30); display.print("IP   : "); display.print(isOnline ? WiFi.localIP().toString() : "192.168.4.1");
+  display.setCursor(2, 42); display.printf("Suhu : %d C (%s)", currentTemp, weatherDesc.c_str()); display.setCursor(2, 54); display.printf("Highscore: %d", highScore);
+}
+void renderMementoMode() {
+  display.setTextSize(3); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(20, 4); display.printf("%02d:%02d", currentHour, currentMin);
+  int percentDay = (((currentHour * 60) + currentMin) * 100) / 1440;
+  display.setTextSize(1); display.setCursor(2, 38); display.printf("Hari berlalu: %d%%", percentDay);
+  display.drawRoundRect(2, 50, 124, 10, 3, OLED_COLOR_WHITE); int fillWidth = map(percentDay, 0, 100, 0, 120); if (fillWidth > 0) display.fillRoundRect(4, 52, fillWidth, 6, 1, OLED_COLOR_WHITE);
+}
+void renderPomodoroMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(24, 4); display.print(pomodoroIsBreak ? "~ ISTIRAHAT ~" : "~ FOKUS KERJA ~"); display.drawFastHLine(0, 14, 128, OLED_COLOR_WHITE);
+  display.setTextSize(3); display.setCursor(20, 24); display.printf("%02d:%02d", pomodoroSecondsLeft / 60, pomodoroSecondsLeft % 60); display.setTextSize(1); display.setCursor(16, 54); display.print(pomodoroRunning ? "[ 1x Klik: Pause ]" : "[ 1x Klik: Start ]");
+}
+void renderGameMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE);
+  if (!gameActive && !gameOver) { display.setCursor(24, 10); display.print("MINI GAME DODGE"); display.setCursor(12, 32); display.print("Klik : Lompat"); display.setCursor(12, 44); display.print("2x Klik: Restart"); return; }
+  display.drawFastHLine(0, 50, 128, OLED_COLOR_WHITE); display.fillRoundRect(16, petY, 12, 12, 3, OLED_COLOR_WHITE); display.fillCircle(19, petY+4, 1, OLED_COLOR_BLACK); 
+  display.fillRect(obstacleX, 50-obstacleHeight, obstacleWidth, obstacleHeight, OLED_COLOR_WHITE); display.setCursor(2, 2); display.printf("SCR: %d", gameScore); display.setCursor(80, 2); display.printf("HI: %d", highScore);
+  if (gameOver) { display.fillRoundRect(16, 16, 96, 32, 4, OLED_COLOR_BLACK); display.drawRoundRect(16, 16, 96, 32, 4, OLED_COLOR_WHITE); display.setCursor(34, 20); display.print("GAME OVER"); display.setCursor(20, 32); display.print("2x Klik: Ulang"); }
+}
+void renderQuoteMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(10, 2); display.print("~ DAILY ORACLE ~"); display.drawFastHLine(0, 12, 128, OLED_COLOR_WHITE);
+  display.setCursor(0, 18); display.println(petQuotes[currentQuoteIdx]); display.drawFastHLine(0, 52, 128, OLED_COLOR_WHITE); display.setCursor(16, 56); display.print("[ Klik 1x: Ganti ]");
+}
+void renderGPSMode(unsigned long currentMillis) {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(15, 0); display.print("RADAR SATELIT"); display.drawFastHLine(0, 10, 128, OLED_COLOR_WHITE);
+  int cx = 100, cy = 36; display.drawCircle(cx, cy, 20, OLED_COLOR_WHITE); display.drawCircle(cx, cy, 10, OLED_COLOR_WHITE);
+  float angle = (currentMillis % 2000) / 2000.0 * 2 * PI; display.drawLine(cx, cy, cx + 20 * cos(angle), cy + 20 * sin(angle), OLED_COLOR_WHITE);
+  if ((currentMillis / 500) % 2 == 0) display.fillCircle(cx + 8, cy - 8, 2, OLED_COLOR_WHITE);
+  display.setCursor(0, 20); display.print("LAT:"); display.setCursor(0, 30); display.println(currentLat, 4); display.setCursor(0, 42); display.print("LON:"); display.setCursor(0, 52); display.println(currentLon, 4);
+}
+void render8BallMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(28, 0); display.print("STOIC 8-BALL"); display.drawFastHLine(0, 10, 128, OLED_COLOR_WHITE);
+  display.setTextSize(2); display.setCursor(15, 28); display.println(stoic8Ball[current8BallIdx]); display.setTextSize(1); display.drawFastHLine(0, 52, 128, OLED_COLOR_WHITE); display.setCursor(12, 56); display.print("[ Klik 1x: Kocok ]");
+}
+void renderPrompterMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE); display.setCursor(12, 0); display.print("~ CHORD PROMPTER ~"); display.drawFastHLine(0, 10, 128, OLED_COLOR_WHITE);
+  display.setCursor(0, 18); display.println(currentPrompterLine); display.drawFastHLine(0, 52, 128, OLED_COLOR_WHITE); display.setCursor(2, 56); display.print("[ Klik 1x: Keluar ]");
+}
+void renderPongMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE);
+  display.drawFastHLine(0, 0, 128, OLED_COLOR_WHITE); display.drawFastHLine(0, 63, 128, OLED_COLOR_WHITE); 
+  for(int i=0; i<64; i+=8) display.drawFastVLine(64, i, 4, OLED_COLOR_WHITE); 
+  display.fillRect(0, pongPlayerY, 2, 16, OLED_COLOR_WHITE); display.fillRect(126, pongAiY, 2, 16, OLED_COLOR_WHITE);
+  display.fillRect((int)pongBX, (int)pongBY, 3, 3, OLED_COLOR_WHITE);
+  display.setCursor(32, 4); display.print(pongScoreP); display.setCursor(92, 4); display.print(pongScoreAI);
+}
+void renderMatrixMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE);
+  for(int i=0; i<16; i++) {
+     matrixY[i] += random(2, 6); if(matrixY[i] > 64) matrixY[i] = 0; 
+     display.setCursor(i*8, matrixY[i]); display.print((char)random(33, 126)); 
+  }
+}
+void renderWifiMode() {
+  display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE);
+  display.setCursor(16, 0); display.print("HACKER RADAR"); display.drawFastHLine(0, 10, 128, OLED_COLOR_WHITE);
+  int n = WiFi.scanComplete();
+  if (n == WIFI_SCAN_FAILED) { WiFi.scanNetworks(true); display.setCursor(0, 24); display.print("Initializing..."); }
+  else if (n == WIFI_SCAN_RUNNING) { display.setCursor(0, 24); display.print("Scanning Area..."); }
+  else if (n == 0) { display.setCursor(0, 24); display.print("No Networks."); WiFi.scanNetworks(true); }
+  else {
+     for (int i = 0; i < min(n, 5); i++) {
+        display.setCursor(0, 14 + (i*10));
+        String ssid = WiFi.SSID(i); if(ssid.length() > 12) ssid = ssid.substring(0, 12);
+        display.print(ssid);
+        int rssi = WiFi.RSSI(i); int barW = map(rssi, -100, -50, 0, 30);
+        if (barW < 0) barW = 0; if (barW > 30) barW = 30;
+        display.fillRect(96, 14 + (i*10), barW, 6, OLED_COLOR_WHITE);
+     }
+     if(millis() - lastWifiScan > 10000) { WiFi.scanNetworks(true); lastWifiScan = millis(); } 
+  }
+}
+void renderMsgMode() {
+  display.setTextSize(2); display.setTextColor(OLED_COLOR_WHITE);
+  display.setCursor(12, 0); display.print("INCOMING!"); display.setTextSize(1); display.drawFastHLine(0, 18, 128, OLED_COLOR_WHITE);
+  display.setCursor(0, 24); display.println(incomingMsg); 
+  display.drawFastHLine(0, 52, 128, OLED_COLOR_WHITE); display.setCursor(2, 56); display.print("[ Klik 1x: Tutup ]");
+}
+
+void setupWebServer() {
+  server.onNotFound([]() {
+    if (server.method() == HTTP_OPTIONS) {
+      server.sendHeader("Access-Control-Allow-Origin", "*");
+      server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      server.sendHeader("Access-Control-Allow-Headers", "*");
+      server.sendHeader("Access-Control-Allow-Private-Network", "true");
+      server.send(204);
+    } else {
+      server.send(404, "text/plain", "Not Found");
+    }
+  });
+
+  server.on("/", []() { 
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.send(200, "text/html", HTML_PAGE); 
+  });
+  
+  server.on("/api/status", []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    server.sendHeader("Access-Control-Allow-Private-Network", "true");
+    
+    String json = "{";
+    json += "\"state\":\"" + getStateString() + "\",";
+    json += "\"level\":" + String(petLevel) + ",";
+    json += "\"title\":\"" + evolutionTitle + "\",";
+    json += "\"temp\":" + String(currentTemp) + ",";
+    json += "\"hunger\":" + String(hungerLevel);
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/feed", []() { server.sendHeader("Access-Control-Allow-Origin", "*"); triggerFeed(); server.send(200, "text/plain", "OK"); });
+  server.on("/wink", []() { server.sendHeader("Access-Control-Allow-Origin", "*"); triggerWink(); server.send(200, "text/plain", "OK"); });
+  server.on("/shock", []() { server.sendHeader("Access-Control-Allow-Origin", "*"); triggerShocked(); server.send(200, "text/plain", "OK"); });
+  server.on("/toggle_pomo", []() { server.sendHeader("Access-Control-Allow-Origin", "*"); pomodoroRunning = !pomodoroRunning; server.send(200, "text/plain", "OK"); });
+  server.on("/deepsleep", []() { server.sendHeader("Access-Control-Allow-Origin", "*"); enterDeepSleep(); });
+  
+  server.on("/set_gps", []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("lat") && server.hasArg("lon")) {
+      currentLat = server.arg("lat").toFloat(); currentLon = server.arg("lon").toFloat();
+      fetchWeather(); currentAppMode = MODE_GPS; playSound("WAKE"); server.send(200, "text/plain", "OK");
+    } else server.send(400, "text/plain", "Error");
+  });
+  
+  server.on("/set_prompter", []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("text")) { currentPrompterLine = server.arg("text"); currentAppMode = MODE_PROMPTER; server.send(200, "text/plain", "OK"); } else server.send(400, "text/plain", "Error");
+  });
+
+  server.on("/send_msg", []() {
+    server.sendHeader("Access-Control-Allow-Origin", "*");
+    if (server.hasArg("text")) {
+      incomingMsg = server.arg("text"); currentAppMode = MODE_MSG; playSound("ALARM"); server.send(200, "text/plain", "OK");
+    } else server.send(400, "text/plain", "Error");
+  });
+}
+
+void setup() {
+  Serial.begin(115200); 
+  pinMode(BUTTON1_PIN, INPUT_PULLUP); 
+  pinMode(BUTTON2_PIN, INPUT_PULLUP); 
+  pinMode(LED_PIN, OUTPUT); 
+  ledcAttach(BUZZER_PIN, 100, 13);
+  randomSeed(analogRead(0));
+  for(int i=0; i<16; i++) matrixY[i] = random(0, 64);
+
+  loadPreferencesData();
+  initOLED(); display.clearDisplay(); display.setTextSize(1); display.setTextColor(OLED_COLOR_WHITE);
+  display.setCursor(10, 24); display.print("Connecting WiFi..."); safeDisplayRender();
+
+  WiFi.setTxPower(WIFI_POWER_8_5dBm); WiFi.begin(wifiSSID.c_str(), wifiPASS.c_str());
+  unsigned long start = millis(); while (WiFi.status() != WL_CONNECTED && millis() - start < 8000) delay(200);
+
+  setupWebServer(); server.begin();
+  if (WiFi.status() == WL_CONNECTED) { 
+    isOnline = true; WiFi.mode(WIFI_STA); configTime(gmtOffset_sec, daylightOffset_sec, ntpServer); MDNS.begin("cyberpet"); 
+    Serial.println("");
+    Serial.println("WIFI CONNECTED!");
+    Serial.print("IP Address: ");
+    Serial.println(WiFi.localIP());
+  } 
+  else { 
+    isOnline = false; WiFi.mode(WIFI_AP); WiFi.softAP("CyberPet_Setup"); delay(4000); 
+  }
+
+  lastInteractionTime = millis(); lastHungerDecay = millis(); stateTimer = millis(); lastTimeUpdate = millis(); resetPongBall();
+}
+
+void loop() {
+  updateTime(); checkNightMode();
+  unsigned long currentMillis = millis();
+
+  if (isOnline) {
+    server.handleClient();
+    if (currentMillis - lastWeatherUpdate > WEATHER_INTERVAL) { fetchWeather(); lastWeatherUpdate = currentMillis; }
+  } else server.handleClient();
+
+  handleButtons(); 
+  updatePomodoro(); updateGameLogic(); updatePongLogic();
+
+  if (currentState == HAPPY || currentState == SHOCKED || currentState == WINK || currentState == LEVEL_UP_STATE) {
+    if (currentMillis - stateTimer > 3000) currentState = IDLE;
+  }
+  
+  if (currentMillis - lastHungerDecay > 180000) {
+    lastHungerDecay = currentMillis;
+    if (hungerLevel > 0) hungerLevel -= 5;
+    if (hungerLevel <= 30) playSound("BEEP"); 
+  }
+
+  display.clearDisplay();
+  switch (currentAppMode) {
+    case MODE_PET: renderPetMode(currentMillis); break;
+    case MODE_STATS: renderStatsMode(); break;
+    case MODE_MEMENTO: renderMementoMode(); break;
+    case MODE_POMODORO: renderPomodoroMode(); break;
+    case MODE_GAME: renderGameMode(); break;
+    case MODE_PONG: renderPongMode(); break;
+    case MODE_QUOTE: renderQuoteMode(); break;
+    case MODE_GPS: renderGPSMode(currentMillis); break;
+    case MODE_8BALL: render8BallMode(); break;
+    case MODE_PROMPTER: renderPrompterMode(); break;
+    case MODE_WIFI: renderWifiMode(); break;
+    case MODE_MATRIX: renderMatrixMode(); break;
+    case MODE_MSG: renderMsgMode(); break;
+  }
+  safeDisplayRender(); delay(20);
+}
